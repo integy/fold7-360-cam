@@ -309,6 +309,13 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
             GLES20.glAttachShader(it, fShader)
             GLES20.glLinkProgram(it)
         }
+        val linkStatus = IntArray(1)
+        GLES20.glGetProgramiv(program, GLES20.GL_LINK_STATUS, linkStatus, 0)
+        if (linkStatus[0] == 0) {
+            Log.e("Fold360", "Program link error: ${GLES20.glGetProgramInfoLog(program)}")
+        } else {
+            Log.i("Fold360", "Shader program linked OK")
+        }
 
         openDualCameras()
     }
@@ -348,7 +355,7 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
         // 錄影：將同一幀繪製到 encoder surface
         if (isRecording) {
             if (!encoderReady) {
-                setupEncoderOnGLThread(outputFile!!)
+                setupEGLSurfaceOnGLThread()
                 encoderReady = true
             }
             drawToEncoder()
@@ -360,9 +367,33 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun startRecording(file: File): Boolean {
         if (isRecording) return false
         outputFile = file
-        isRecording = true
-        encoderReady = false
-        return true
+        try {
+            // MediaCodec + Muxer setup 喺 caller thread（UI thread），
+            // 唔喺 GL thread 做 blocking 初始化（修 freeze）
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, 12_000_000)
+                setInteger(MediaFormat.KEY_FRAME_RATE, 30)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            }
+            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+                configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                encoderSurface = createInputSurface()
+                start()
+            }
+            mediaMuxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxerStarted = false
+            trackIndex = -1
+            framePending = false
+            isRecording = true
+            encoderReady = false  // EGL surface 未建立，等 onDrawFrame
+            Log.i("Fold360", "Encoder ready, waiting EGL surface setup on GL thread")
+            return true
+        } catch (e: Exception) {
+            Log.e("Fold360", "startRecording failed", e)
+            releaseEncoder()
+            return false
+        }
     }
 
     @Synchronized
@@ -378,27 +409,10 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
         }
     }
 
-    private fun setupEncoderOnGLThread(file: File) {
-        // H.264 硬體編碼器
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, 12_000_000)
-            setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        }
-        mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            encoderSurface = createInputSurface()
-            start()
-        }
-
-        mediaMuxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-        muxerStarted = false
-        trackIndex = -1
-        framePending = false
-
-        // 關鍵修正：用 GLSurfaceView 當前 context（GL thread）作為共享 context，
-        // 令 encoder surface 可以讀到 preview 嘅 texture（否則黑畫面）
+    private fun setupEGLSurfaceOnGLThread() {
+        if (eglSurface != null) return
+        // 用 GLSurfaceView 當前 context（GL thread）作為共享 context，
+        // 令 encoder surface 可以讀到 preview 嘅 texture（修黑畫面）
         val display = EGL14.eglGetCurrentDisplay()
         val sharedContext = EGL14.eglGetCurrentContext()
         eglDisplay = display
@@ -410,7 +424,7 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
         )
         eglSurface = EGL14.eglCreateWindowSurface(display, eglConfig, encoderSurface!!, intArrayOf(EGL14.EGL_NONE), 0)
-        renderTargetsDirty = true
+        Log.i("Fold360", "EGL surface ready")
     }
 
     private fun chooseConfig(display: EGLDisplay): android.opengl.EGLConfig {
@@ -578,6 +592,7 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         var backId = "0"
         var frontId = "1"
+        var foundConcurrent = false
 
         for (set in manager.concurrentCameraIds) {
             var b: String? = null
@@ -590,26 +605,30 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
             if (b != null && f != null) {
                 backId = b
                 frontId = f
+                foundConcurrent = true
                 break
             }
         }
+        Log.i("Fold360", "Dual camera: back=$backId front=$frontId concurrent=$foundConcurrent")
 
         val backSurface = Surface(backTex)
         val frontSurface = Surface(frontTex)
 
         manager.openCamera(backId, object : CameraDevice.StateCallback() {
             override fun onOpened(cam1: CameraDevice) {
+                Log.i("Fold360", "Back camera opened: $backId")
                 startSession(cam1, backSurface)
                 manager.openCamera(frontId, object : CameraDevice.StateCallback() {
                     override fun onOpened(cam2: CameraDevice) {
+                        Log.i("Fold360", "Front camera opened: $frontId")
                         startSession(cam2, frontSurface)
                     }
-                    override fun onDisconnected(c: CameraDevice) { c.close() }
-                    override fun onError(c: CameraDevice, e: Int) { c.close() }
+                    override fun onDisconnected(c: CameraDevice) { Log.w("Fold360", "Front disconnected"); c.close() }
+                    override fun onError(c: CameraDevice, e: Int) { Log.e("Fold360", "Front open error: $e"); c.close() }
                 }, cameraHandler)
             }
-            override fun onDisconnected(c: CameraDevice) { c.close() }
-            override fun onError(c: CameraDevice, e: Int) { c.close() }
+            override fun onDisconnected(c: CameraDevice) { Log.w("Fold360", "Back disconnected"); c.close() }
+            override fun onError(c: CameraDevice, e: Int) { Log.e("Fold360", "Back open error: $e"); c.close() }
         }, cameraHandler)
     }
 
