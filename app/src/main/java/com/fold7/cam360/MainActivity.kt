@@ -236,6 +236,7 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     // ---- 錄影狀態 ----
     @Volatile private var isRecording = false
+    @Volatile private var encoderReady = false
     private var mediaCodec: MediaCodec? = null
     private var mediaMuxer: MediaMuxer? = null
     private var trackIndex = -1
@@ -245,6 +246,7 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
     private var eglDisplay: EGLDisplay? = null
     private var eglContext: EGLContext? = null
     private var eglSurface: EGLSurface? = null
+    private var viewSurface: EGLSurface? = null
     private var framePending = false
     private var renderTargetsDirty = true
 
@@ -345,6 +347,10 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         // 錄影：將同一幀繪製到 encoder surface
         if (isRecording) {
+            if (!encoderReady) {
+                setupEncoderOnGLThread(outputFile!!)
+                encoderReady = true
+            }
             drawToEncoder()
         }
     }
@@ -354,16 +360,9 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
     fun startRecording(file: File): Boolean {
         if (isRecording) return false
         outputFile = file
-        try {
-            setupEncoder(file)
-            isRecording = true
-            return true
-        } catch (e: Exception) {
-            Log.e("Fold360", "startRecording failed", e)
-            releaseEncoder()
-            isRecording = false
-            return false
-        }
+        isRecording = true
+        encoderReady = false
+        return true
     }
 
     @Synchronized
@@ -379,7 +378,7 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
         }
     }
 
-    private fun setupEncoder(file: File) {
+    private fun setupEncoderOnGLThread(file: File) {
         // H.264 硬體編碼器
         val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, 1920, 1080).apply {
             setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
@@ -398,14 +397,16 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
         trackIndex = -1
         framePending = false
 
-        // 建立 EGL recordable surface 連接到 encoder input surface
-        val display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
+        // 關鍵修正：用 GLSurfaceView 當前 context（GL thread）作為共享 context，
+        // 令 encoder surface 可以讀到 preview 嘅 texture（否則黑畫面）
+        val display = EGL14.eglGetCurrentDisplay()
+        val sharedContext = EGL14.eglGetCurrentContext()
         eglDisplay = display
-        val version = IntArray(2)
-        EGL14.eglInitialize(display, version, 0, version, 1)
+        viewSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+
         val eglConfig = chooseConfig(display)
         eglContext = EGL14.eglCreateContext(
-            display, eglConfig, EGL14.EGL_NO_CONTEXT,
+            display, eglConfig, sharedContext,
             intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
         )
         eglSurface = EGL14.eglCreateWindowSurface(display, eglConfig, encoderSurface!!, intArrayOf(EGL14.EGL_NONE), 0)
@@ -460,6 +461,12 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
         EGLExt.eglPresentationTimeANDROID(display, surface, System.nanoTime())
         EGL14.eglSwapBuffers(display, surface)
+
+        // 還原 GLSurfaceView 嘅 surface，避免干擾下一幀 preview
+        val view = viewSurface
+        if (view != null) {
+            EGL14.eglMakeCurrent(display, view, view, context)
+        }
 
         drainEncoderIfNeeded()
     }
@@ -559,8 +566,10 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
         eglSurface = null
         eglContext = null
         eglDisplay = null
+        viewSurface = null
         muxerStarted = false
         trackIndex = -1
+        encoderReady = false
     }
 
     // ---- 雙鏡頭開啟 ----
