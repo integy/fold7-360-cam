@@ -122,6 +122,14 @@ class MainActivity : Activity() {
         glSurfaceView.onResume()
     }
 
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == 100 && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            Log.i("Fold360", "Camera permission granted, opening cameras")
+            glSurfaceView.queueEvent { renderer.openDualCameras() }
+        }
+    }
+
     // 寫入 Google Spherical V1 UUID Metadata 並複製到公開相簿
     private fun injectSphericalMetadataAndSaveToGallery(sourceFile: File) {
         try {
@@ -325,8 +333,16 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
     }
 
     override fun onDrawFrame(gl: javax.microedition.khronos.opengles.GL10?) {
-        backTex.updateTexImage()
-        frontTex.updateTexImage()
+        try {
+            backTex.updateTexImage()
+        } catch (e: Exception) {
+            Log.w("Fold360", "backTex update fail: ${e.message}")
+        }
+        try {
+            frontTex.updateTexImage()
+        } catch (e: Exception) {
+            Log.w("Fold360", "frontTex update fail: ${e.message}")
+        }
 
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
         GLES20.glUseProgram(program)
@@ -411,20 +427,24 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     private fun setupEGLSurfaceOnGLThread() {
         if (eglSurface != null) return
-        // 用 GLSurfaceView 當前 context（GL thread）作為共享 context，
-        // 令 encoder surface 可以讀到 preview 嘅 texture（修黑畫面）
-        val display = EGL14.eglGetCurrentDisplay()
-        val sharedContext = EGL14.eglGetCurrentContext()
-        eglDisplay = display
-        viewSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        try {
+            // 用 GLSurfaceView 當前 context（GL thread）作為共享 context，
+            // 令 encoder surface 可以讀到 preview 嘅 texture（修黑畫面）
+            val display = EGL14.eglGetCurrentDisplay()
+            val sharedContext = EGL14.eglGetCurrentContext()
+            eglDisplay = display
+            viewSurface = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
 
-        val eglConfig = chooseConfig(display)
-        eglContext = EGL14.eglCreateContext(
-            display, eglConfig, sharedContext,
-            intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
-        )
-        eglSurface = EGL14.eglCreateWindowSurface(display, eglConfig, encoderSurface!!, intArrayOf(EGL14.EGL_NONE), 0)
-        Log.i("Fold360", "EGL surface ready")
+            val eglConfig = chooseConfig(display)
+            eglContext = EGL14.eglCreateContext(
+                display, eglConfig, sharedContext,
+                intArrayOf(EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE), 0
+            )
+            eglSurface = EGL14.eglCreateWindowSurface(display, eglConfig, encoderSurface!!, intArrayOf(EGL14.EGL_NONE), 0)
+            Log.i("Fold360", "EGL surface ready")
+        } catch (e: Exception) {
+            Log.e("Fold360", "EGL setup failed", e)
+        }
     }
 
     private fun chooseConfig(display: EGLDisplay): android.opengl.EGLConfig {
@@ -588,7 +608,11 @@ class StitchRenderer(private val context: Context) : GLSurfaceView.Renderer {
 
     // ---- 雙鏡頭開啟 ----
     @SuppressLint("MissingPermission")
-    private fun openDualCameras() {
+    fun openDualCameras() {
+        if (context.checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            Log.w("Fold360", "Camera permission not granted yet, skip opening")
+            return
+        }
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
         var backId = "0"
         var frontId = "1"
